@@ -64,25 +64,54 @@ void reset_color(void) {
     write(0, term_buf, len);
 }
 
+typedef enum {
+    PATCH_MODIFY,
+    PATCH_ADD,
+    PATCH_DELETE,
+} PatchType;
+
 typedef struct {
     char *name;
     char *data;
     uint64_t size;
 } File;
 
-void print_block(File file, uint64_t buffer_size, uint64_t offset) {
-    if (((int64_t)file.size - (int64_t)offset) <= 0) {
+typedef struct {
+    PatchType type;
+    uint64_t offset;
+    uint8_t data;
+} Patch;
+
+typedef struct {
+    uint64_t rows;
+    uint64_t cols;
+} Window;
+
+typedef struct {
+    File file;
+    Window w;
+    int x;
+    int y;
+
+    uint64_t block_size;
+    uint64_t offset;
+
+    Patch patch;
+} ViewState;
+
+void print_block(ViewState *v, uint64_t buffer_size, uint64_t offset) {
+    if (((int64_t)v->file.size - (int64_t)offset) <= 0) {
         printf("no bytes to display!\n");
         return;
     }
 
-    uint64_t rem_file_size = file.size - offset;
+    uint64_t rem_file_size = v->file.size - offset;
     uint64_t read_size = buffer_size;
     if (rem_file_size < buffer_size) {
         read_size = rem_file_size % buffer_size;
     }
 
-    char *buffer = file.data + offset;
+    char *buffer = v->file.data + offset;
 
     uint64_t chunk_size = 16;
     for (int i = 0; i < (buffer_size / chunk_size); i++) {
@@ -100,8 +129,19 @@ void print_block(File file, uint64_t buffer_size, uint64_t offset) {
                 printf("   ");
                 continue;
             }
+            uint64_t byte_idx = offset + sub_idx + j;
 
-            printf("%02x ", row[j]);
+            uint8_t ch = row[j];
+            bool patching = false;
+
+            if (v->patch.offset == byte_idx && v->patch.type == PATCH_MODIFY) {
+                ch = v->patch.data;
+                patching = true;
+            }
+
+            if (patching) { printf("\x1b[38;5;1m"); }
+            printf("%02x ", ch);
+            if (patching) { printf("\x1b[0m"); }
         }
         printf(" \x1b[38;5;248m");
         for (int j = 0; j < chunk_size; j++) {
@@ -109,12 +149,23 @@ void print_block(File file, uint64_t buffer_size, uint64_t offset) {
                 printf("   ");
                 continue;
             }
+            uint64_t byte_idx = offset + sub_idx + j;
 
             char ch = row[j];
+            bool patching = false;
+
+            if (v->patch.offset == byte_idx && v->patch.type == PATCH_MODIFY) {
+                ch = v->patch.data;
+                patching = true;
+            }
+
             if (!is_printable(ch)) {
                 ch = '.';
             }
+
+            if (patching) { printf("\x1b[38;5;1m"); }
             printf("%c", ch);
+            if (patching) { printf("\x1b[0m"); }
         }
         printf("\x1b[0m\n");
 
@@ -125,8 +176,6 @@ void print_block(File file, uint64_t buffer_size, uint64_t offset) {
 
     return;
 }
-
-
 
 struct termios orig_termios;
 void cleanup_term(void) {
@@ -144,10 +193,6 @@ void init_term(void) {
     tcsetattr(0, TCSAFLUSH, &raw);
 }
 
-typedef struct {
-    uint64_t rows;
-    uint64_t cols;
-} Window;
 
 bool get_term_size(Window *w) {
     struct winsize ws;
@@ -160,17 +205,7 @@ bool get_term_size(Window *w) {
     return true;
 }
 
-typedef struct {
-    File file;
-    Window w;
-    int x;
-    int y;
-
-    uint64_t block_size;
-    uint64_t offset;
-} ViewState;
 ViewState view;
-
 void refresh_screen(void) {
     clear_term();
     reset_cursor();
@@ -179,10 +214,10 @@ void refresh_screen(void) {
     set_foreground(232);
     erase_line();
 
-    printf(" %s\n", view.file.name);
+    printf("%s -- %llu bytes\n", view.file.name, view.file.size);
 
     reset_color();
-    print_block(view.file, (view.w.rows - 1) * 16, view.offset);
+    print_block(&view, (view.w.rows - 1) * 16, view.offset);
     set_cursor(view.w.rows + 1, 1);
 }
 
@@ -222,27 +257,43 @@ int main(int argc, char **argv) {
         .file = (File){.name = argv[1], .data = file_bytes, .size = file_size},
         .offset = 0,
         .x = 1,
-        .y = 1
+        .y = 1,
+        .patch = (Patch){.type = PATCH_MODIFY, .offset = 10, .data = 'a'},
     };
     get_term_size(&view.w);
     signal(SIGWINCH, handle_sigwinch);
 
+    bool insert_mode = false;
     for (;;) {
         refresh_screen();
-
         char ch;
+
+    read_char:
         read(0, &ch, 1);
 
-        switch (ch) {
-            case 'w': {
-                view.offset = MAX((int64_t)(view.offset - 16), 0);
-            } break;
-            case 's': {
-                view.offset = MIN(view.offset + 16, view.file.size);
-            } break;
-            case 'q': {
-                return 1;
-            } break;
+        uint64_t max_offset = (uint64_t)(MAX(0, (int64_t)(view.file.size - (view.file.size % 16)) - (int64_t)((view.w.rows - 2) * 16)));
+
+        if (!insert_mode) {
+            switch (ch) {
+                case 'g': {
+                    view.offset = 0;
+                } break;
+                case 'G': {
+                    view.offset = max_offset;
+                } break;
+                case 'k': {
+                    view.offset = (uint64_t)MAX((int64_t)(view.offset - 16), 0);
+                } break;
+                case 'j': {
+                    view.offset = MIN(view.offset + 16, max_offset);
+                } break;
+                case 'q': {
+                    return 1;
+                } break;
+                default: {
+                    goto read_char;
+                } break;
+            }
         }
     }
 }
