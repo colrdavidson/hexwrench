@@ -64,6 +64,12 @@ void reset_color(void) {
     write(0, term_buf, len);
 }
 
+typedef struct {
+    char *name;
+    char *data;
+    uint64_t size;
+} File;
+
 typedef enum {
     PATCH_MODIFY,
     PATCH_ADD,
@@ -71,16 +77,16 @@ typedef enum {
 } PatchType;
 
 typedef struct {
-    char *name;
-    char *data;
-    uint64_t size;
-} File;
-
-typedef struct {
     PatchType type;
     uint64_t offset;
     uint8_t data;
 } Patch;
+
+typedef struct {
+    Patch *data;
+    uint64_t len;
+    uint64_t cap;
+} Patches;
 
 typedef struct {
     uint64_t rows;
@@ -96,7 +102,7 @@ typedef struct {
     uint64_t block_size;
     uint64_t offset;
 
-    Patch patch;
+    Patches patches;
 } ViewState;
 
 void print_block(ViewState *v, uint64_t buffer_size, uint64_t offset) {
@@ -134,9 +140,14 @@ void print_block(ViewState *v, uint64_t buffer_size, uint64_t offset) {
             uint8_t ch = row[j];
             bool patching = false;
 
-            if (v->patch.offset == byte_idx && v->patch.type == PATCH_MODIFY) {
-                ch = v->patch.data;
-                patching = true;
+            for (int k = 0; k < v->patches.len; k++) {
+                Patch p = v->patches.data[k];
+
+                if (p.offset == byte_idx && p.type == PATCH_MODIFY) {
+                    ch = p.data;
+                    patching = true;
+                    break;
+                }
             }
 
             if (patching) { printf("\x1b[38;5;1m"); }
@@ -154,9 +165,14 @@ void print_block(ViewState *v, uint64_t buffer_size, uint64_t offset) {
             char ch = row[j];
             bool patching = false;
 
-            if (v->patch.offset == byte_idx && v->patch.type == PATCH_MODIFY) {
-                ch = v->patch.data;
-                patching = true;
+            for (int k = 0; k < v->patches.len; k++) {
+                Patch p = v->patches.data[k];
+
+                if (p.offset == byte_idx && p.type == PATCH_MODIFY) {
+                    ch = p.data;
+                    patching = true;
+                    break;
+                }
             }
 
             if (!is_printable(ch)) {
@@ -226,6 +242,16 @@ void handle_sigwinch(int unused) {
     refresh_screen();
 }
 
+void append_patch(Patches *p, Patch patch) {
+    if ((p->len + 1) > p->cap) {
+        p->cap *= 2;
+        p->data = realloc(p->data, sizeof(Patch) * p->cap);
+    }
+
+    p->data[p->len] = patch;
+    p->len += 1;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         printf("Expected %s <name of file>\n", argv[0]);
@@ -253,12 +279,17 @@ int main(int argc, char **argv) {
 
     init_term();
 
+    Patches patches = (Patches){.data = malloc(sizeof(Patch) * 8), .len = 0, .cap = 8};
+    append_patch(&patches, (Patch){.type = PATCH_MODIFY, .offset = 10, .data = 'a'});
+    append_patch(&patches, (Patch){.type = PATCH_MODIFY, .offset = 11, .data = 'b'});
+    append_patch(&patches, (Patch){.type = PATCH_MODIFY, .offset = 12, .data = 'c'});
+
     view = (ViewState){
         .file = (File){.name = argv[1], .data = file_bytes, .size = file_size},
         .offset = 0,
         .x = 1,
         .y = 1,
-        .patch = (Patch){.type = PATCH_MODIFY, .offset = 10, .data = 'a'},
+        .patches = patches,
     };
     get_term_size(&view.w);
     signal(SIGWINCH, handle_sigwinch);
