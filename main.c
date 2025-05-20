@@ -14,6 +14,10 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
+bool is_printable(char c) {
+    return (c >= 32 && c <= 126);
+}
+
 char term_buf[32] = {};
 void enable_altbuffer(void) {
     int len = snprintf(term_buf, sizeof(term_buf), "\x1b[?1049h");
@@ -107,7 +111,7 @@ void print_block(File file, uint64_t buffer_size, uint64_t offset) {
             }
 
             char ch = row[j];
-            if (ch == '\n' || ch == '\t') {
+            if (!is_printable(ch)) {
                 ch = '.';
             }
             printf("%c", ch);
@@ -159,6 +163,8 @@ bool get_term_size(Window *w) {
 typedef struct {
     File file;
     Window w;
+    int x;
+    int y;
 
     uint64_t block_size;
     uint64_t offset;
@@ -214,7 +220,9 @@ int main(int argc, char **argv) {
 
     view = (ViewState){
         .file = (File){.name = argv[1], .data = file_bytes, .size = file_size},
-        .offset = 0
+        .offset = 0,
+        .x = 1,
+        .y = 1
     };
     get_term_size(&view.w);
     signal(SIGWINCH, handle_sigwinch);
