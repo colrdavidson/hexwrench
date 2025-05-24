@@ -14,6 +14,71 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
+#define ARR_APPEND(arr, val) do {                                        \
+    if (((arr)->len + 1) > (arr)->cap) {                                 \
+        (arr)->cap + MAX((arr)->cap * 2, 8);                             \
+        (arr)->data = realloc((arr)->data, sizeof(*arr) * (arr)->cap);   \
+    }                                                                    \
+                                                                         \
+    (arr)->data[(arr)->len] = (val);                                     \
+    (arr)->len += 1;                                                     \
+} while (0);
+
+typedef struct {
+    char *name;
+    uint8_t *data;
+    uint64_t size;
+} File;
+
+typedef struct {
+    uint8_t *data;
+    uint64_t len;
+    uint64_t offset;
+
+    bool patch;
+} Block;
+
+typedef struct {
+    Block *data;
+    uint64_t len;
+    uint64_t cap;
+} BlockArr;
+
+struct _BlockNode;
+
+typedef struct BlockNodeArr {
+    struct _BlockNode *data;
+    uint64_t len;
+    uint64_t cap;
+} BlockNodeArr;
+
+typedef struct _BlockNode {
+    BlockNodeArr children;
+
+    uint64_t chunk_offset_idx;
+    uint8_t  chunk_len;
+    uint64_t chunk_min_offset;
+    uint64_t chunk_max_offset;
+} BlockNode;
+
+typedef struct {
+    uint64_t rows;
+    uint64_t cols;
+} Window;
+
+typedef struct {
+    File file;
+    Window w;
+    int x;
+    int y;
+
+    uint64_t block_size;
+    uint64_t offset;
+
+    BlockNode overlay;
+    BlockArr blocks;
+} ViewState;
+
 bool is_printable(char c) {
     return (c >= 32 && c <= 126);
 }
@@ -64,48 +129,7 @@ void reset_color(void) {
     write(0, term_buf, len);
 }
 
-typedef struct {
-    char *name;
-    char *data;
-    uint64_t size;
-} File;
-
-typedef enum {
-    PATCH_MODIFY,
-    PATCH_ADD,
-    PATCH_DELETE,
-} PatchType;
-
-typedef struct {
-    PatchType type;
-    uint64_t offset;
-    uint8_t data;
-} Patch;
-
-typedef struct {
-    Patch *data;
-    uint64_t len;
-    uint64_t cap;
-} Patches;
-
-typedef struct {
-    uint64_t rows;
-    uint64_t cols;
-} Window;
-
-typedef struct {
-    File file;
-    Window w;
-    int x;
-    int y;
-
-    uint64_t block_size;
-    uint64_t offset;
-
-    Patches patches;
-} ViewState;
-
-void print_block(ViewState *v, uint64_t buffer_size, uint64_t offset) {
+void print_view(ViewState *v, uint64_t buffer_size, uint64_t offset) {
     if (((int64_t)v->file.size - (int64_t)offset) <= 0) {
         printf("no bytes to display!\n");
         return;
@@ -117,7 +141,7 @@ void print_block(ViewState *v, uint64_t buffer_size, uint64_t offset) {
         read_size = rem_file_size % buffer_size;
     }
 
-    char *buffer = v->file.data + offset;
+    uint8_t *buffer = v->file.data + offset;
 
     uint64_t chunk_size = 16;
     for (int i = 0; i < (buffer_size / chunk_size); i++) {
@@ -138,21 +162,7 @@ void print_block(ViewState *v, uint64_t buffer_size, uint64_t offset) {
             uint64_t byte_idx = offset + sub_idx + j;
 
             uint8_t ch = row[j];
-            bool patching = false;
-
-            for (int k = 0; k < v->patches.len; k++) {
-                Patch p = v->patches.data[k];
-
-                if (p.offset == byte_idx && p.type == PATCH_MODIFY) {
-                    ch = p.data;
-                    patching = true;
-                    break;
-                }
-            }
-
-            if (patching) { printf("\x1b[38;5;1m"); }
             printf("%02x ", ch);
-            if (patching) { printf("\x1b[0m"); }
         }
         printf(" \x1b[38;5;248m");
         for (int j = 0; j < chunk_size; j++) {
@@ -163,25 +173,12 @@ void print_block(ViewState *v, uint64_t buffer_size, uint64_t offset) {
             uint64_t byte_idx = offset + sub_idx + j;
 
             char ch = row[j];
-            bool patching = false;
-
-            for (int k = 0; k < v->patches.len; k++) {
-                Patch p = v->patches.data[k];
-
-                if (p.offset == byte_idx && p.type == PATCH_MODIFY) {
-                    ch = p.data;
-                    patching = true;
-                    break;
-                }
-            }
 
             if (!is_printable(ch)) {
                 ch = '.';
             }
 
-            if (patching) { printf("\x1b[38;5;1m"); }
             printf("%c", ch);
-            if (patching) { printf("\x1b[0m"); }
         }
         printf("\x1b[0m\n");
 
@@ -233,7 +230,7 @@ void refresh_screen(void) {
     printf("%s -- %llu bytes\n", view.file.name, view.file.size);
 
     reset_color();
-    print_block(&view, (view.w.rows - 1) * 16, view.offset);
+    print_view(&view, (view.w.rows - 1) * 16, view.offset);
     set_cursor(view.w.rows + 1, 1);
 }
 
@@ -242,14 +239,58 @@ void handle_sigwinch(int unused) {
     refresh_screen();
 }
 
-void append_patch(Patches *p, Patch patch) {
-    if ((p->len + 1) > p->cap) {
-        p->cap *= 2;
-        p->data = realloc(p->data, sizeof(Patch) * p->cap);
+bool range_in_range(uint64_t start_a, uint64_t end_a, uint64_t start_b, uint64_t end_b) {
+    return start_b >= start_a && end_b <= end_a;
+}
+
+bool block_contains_block(Block *a, Block *b) {
+    return range_in_range(
+        a->offset, a->offset + a->len,
+        b->offset, b->offset + b->len
+    );
+}
+
+BlockNode new_blocknode(uint64_t chunk_offset_idx, uint64_t min_offset, uint64_t max_offset) {
+    BlockNode node = (BlockNode){
+        .children = (BlockNodeArr){},
+        .chunk_offset_idx = chunk_offset_idx,
+        .chunk_len = 1,
+        .chunk_min_offset = min_offset,
+        .chunk_max_offset = max_offset
+    };
+    return node;
+}
+
+void insert_data(ViewState *view, Block block) {
+    BlockNode *cur = &view->overlay;
+    Block *new_b = &block;
+
+    BlockNodeArr queue;
+    // Do a BFS scan for leaf with containing range
+    // or append to the far tail to expand the range
+    // for (;;) {}
+
+    // Not a leaf node
+    if (cur->children.data != NULL) {
+        return;
     }
 
-    p->data[p->len] = patch;
-    p->len += 1;
+    for (int i = 0; i < cur->chunk_len; i++) {
+        uint64_t idx = cur->chunk_offset_idx + i;
+        Block *b = &view->blocks.data[idx];
+
+        if (block_contains_block(b, new_b)) {
+            printf("inserting block between two blocks\n");
+            break;
+            //new_blocknode(
+        }
+    }
+}
+
+void init_edit_tree(ViewState *view) {
+    view->overlay = new_blocknode(0, 0, view->file.size);
+    view->blocks = (BlockArr){};
+    ARR_APPEND(&view->blocks, ((Block){.offset = 0, .data = view->file.data, .len = view->file.size}));
 }
 
 int main(int argc, char **argv) {
@@ -271,26 +312,23 @@ int main(int argc, char **argv) {
     }
     uint64_t file_size = info.st_size;
 
-    char *file_bytes = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    uint8_t *file_bytes = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (file_bytes == MAP_FAILED) {
         printf("Failed to map file %s\n", argv[1]);
         return 1;
     }
 
-    init_term();
-
-    Patches patches = (Patches){.data = malloc(sizeof(Patch) * 8), .len = 0, .cap = 8};
-    append_patch(&patches, (Patch){.type = PATCH_MODIFY, .offset = 10, .data = 'a'});
-    append_patch(&patches, (Patch){.type = PATCH_MODIFY, .offset = 11, .data = 'b'});
-    append_patch(&patches, (Patch){.type = PATCH_MODIFY, .offset = 12, .data = 'c'});
+    //init_term();
 
     view = (ViewState){
         .file = (File){.name = argv[1], .data = file_bytes, .size = file_size},
-        .offset = 0,
         .x = 1,
         .y = 1,
-        .patches = patches,
     };
+    init_edit_tree(&view);
+    insert_data(&view, (Block){.offset = 10, .data = (uint8_t *)"a", .len = 1});
+/*
+
     get_term_size(&view.w);
     signal(SIGWINCH, handle_sigwinch);
 
@@ -327,4 +365,5 @@ int main(int argc, char **argv) {
             }
         }
     }
+*/
 }
