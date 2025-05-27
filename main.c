@@ -14,14 +14,32 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
-#define ARR_APPEND(arr, val) do {                                        \
-    if (((arr)->len + 1) > (arr)->cap) {                                 \
-        (arr)->cap + MAX((arr)->cap * 2, 8);                             \
-        (arr)->data = realloc((arr)->data, sizeof(*arr) * (arr)->cap);   \
-    }                                                                    \
-                                                                         \
-    (arr)->data[(arr)->len] = (val);                                     \
-    (arr)->len += 1;                                                     \
+#define ARR_EXPAND(arr) do {                                                   \
+    if (((arr)->len + 1) > (arr)->cap) {                                       \
+        (arr)->cap = MAX((arr)->cap * 2, 8);                                   \
+        (arr)->data = realloc((arr)->data, sizeof(*(arr)->data) * (arr)->cap); \
+    }                                                                          \
+    (arr)->len += 1;                                                           \
+} while (0);
+
+#define ARR_APPEND(arr, val) do {                                              \
+    if (((arr)->len + 1) > (arr)->cap) {                                       \
+        (arr)->cap = MAX((arr)->cap * 2, 8);                                   \
+        (arr)->data = realloc((arr)->data, sizeof(*(arr)->data) * (arr)->cap); \
+    }                                                                          \
+                                                                               \
+    (arr)->data[(arr)->len] = (val);                                           \
+    (arr)->len += 1;                                                           \
+} while (0);
+
+#define ARR_INSERT(arr, val, off) do {                                                                    \
+    if ((off) == (arr)->len) {                                                                            \
+        ARR_APPEND(arr, val);                                                                             \
+    } else {                                                                                              \
+        ARR_EXPAND(arr);                                                                                  \
+        memmove(&(arr)->data[(off)+1], &(arr)->data[(off)], sizeof(*(arr)->data) * ((arr)->len - (off))); \
+        (arr)->data[(off)] = (val);                                                                       \
+    }                                                                                                     \
 } while (0);
 
 typedef struct {
@@ -33,7 +51,6 @@ typedef struct {
 typedef struct {
     uint8_t *data;
     uint64_t len;
-    uint64_t offset;
 
     bool patch;
 } Block;
@@ -43,23 +60,6 @@ typedef struct {
     uint64_t len;
     uint64_t cap;
 } BlockArr;
-
-struct _BlockNode;
-
-typedef struct BlockNodeArr {
-    struct _BlockNode *data;
-    uint64_t len;
-    uint64_t cap;
-} BlockNodeArr;
-
-typedef struct _BlockNode {
-    BlockNodeArr children;
-
-    uint64_t chunk_offset_idx;
-    uint8_t  chunk_len;
-    uint64_t chunk_min_offset;
-    uint64_t chunk_max_offset;
-} BlockNode;
 
 typedef struct {
     uint64_t rows;
@@ -72,10 +72,9 @@ typedef struct {
     int x;
     int y;
 
-    uint64_t block_size;
+    uint64_t view_size;
     uint64_t offset;
 
-    BlockNode overlay;
     BlockArr blocks;
 } ViewState;
 
@@ -129,19 +128,17 @@ void reset_color(void) {
     write(0, term_buf, len);
 }
 
-void print_view(ViewState *v, uint64_t buffer_size, uint64_t offset) {
-    if (((int64_t)v->file.size - (int64_t)offset) <= 0) {
+void print_view(uint8_t *buffer, uint64_t total_size, uint64_t buffer_size, uint64_t offset) {
+    if (((int64_t)total_size - (int64_t)offset) <= 0) {
         printf("no bytes to display!\n");
         return;
     }
 
-    uint64_t rem_file_size = v->file.size - offset;
+    uint64_t rem_file_size = total_size - offset;
     uint64_t read_size = buffer_size;
     if (rem_file_size < buffer_size) {
         read_size = rem_file_size % buffer_size;
     }
-
-    uint8_t *buffer = v->file.data + offset;
 
     uint64_t chunk_size = 16;
     for (int i = 0; i < (buffer_size / chunk_size); i++) {
@@ -230,7 +227,7 @@ void refresh_screen(void) {
     printf("%s -- %llu bytes\n", view.file.name, view.file.size);
 
     reset_color();
-    print_view(&view, (view.w.rows - 1) * 16, view.offset);
+    //print_view(&view, (view.w.rows - 1) * 16, view.offset);
     set_cursor(view.w.rows + 1, 1);
 }
 
@@ -239,58 +236,168 @@ void handle_sigwinch(int unused) {
     refresh_screen();
 }
 
-bool range_in_range(uint64_t start_a, uint64_t end_a, uint64_t start_b, uint64_t end_b) {
-    return start_b >= start_a && end_b <= end_a;
+Block new_block(uint8_t *data, uint64_t len) {
+    return (Block){.data = data, .len = len};
 }
 
-bool block_contains_block(Block *a, Block *b) {
-    return range_in_range(
-        a->offset, a->offset + a->len,
-        b->offset, b->offset + b->len
-    );
+void print_block(Block *b) {
+    printf("Block %p %llu\n", b->data, b->len);
 }
 
-BlockNode new_blocknode(uint64_t chunk_offset_idx, uint64_t min_offset, uint64_t max_offset) {
-    BlockNode node = (BlockNode){
-        .children = (BlockNodeArr){},
-        .chunk_offset_idx = chunk_offset_idx,
-        .chunk_len = 1,
-        .chunk_min_offset = min_offset,
-        .chunk_max_offset = max_offset
-    };
-    return node;
+void print_blocks(BlockArr *blocks) {
+    uint64_t accum_offset = 0;
+    for (int i = 0; i < blocks->len; i++) {
+        Block *b = &blocks->data[i];
+        printf("Block %p | off: %llu len: %llu\n", b->data, accum_offset, b->len);
+        accum_offset += b->len;
+    }
 }
 
-void insert_data(ViewState *view, Block block) {
-    BlockNode *cur = &view->overlay;
-    Block *new_b = &block;
+uint64_t get_total_size(ViewState *view) {
+    uint64_t accum_offset = 0;
+    for (int i = 0; i < view->blocks.len; i++) {
+        accum_offset += view->blocks.data[i].len;
+    }
+    return accum_offset;
+}
 
-    BlockNodeArr queue;
-    // Do a BFS scan for leaf with containing range
-    // or append to the far tail to expand the range
-    // for (;;) {}
-
-    // Not a leaf node
-    if (cur->children.data != NULL) {
+void delete_data(ViewState *view, uint64_t offset, uint64_t len) {
+    if (len == 0) {
         return;
     }
 
-    for (int i = 0; i < cur->chunk_len; i++) {
-        uint64_t idx = cur->chunk_offset_idx + i;
-        Block *b = &view->blocks.data[idx];
+    uint64_t accum_offset = 0;
+    for (int i = 0; i < view->blocks.len; i++) {
+        Block *b = &view->blocks.data[i];
 
-        if (block_contains_block(b, new_b)) {
-            printf("inserting block between two blocks\n");
-            break;
-            //new_blocknode(
+        uint64_t b_off = accum_offset;
+        accum_offset += b->len;
+
+        // Skip any block that ends before our delete
+        if (offset > accum_offset) {
+            continue;
         }
     }
 }
 
-void init_edit_tree(ViewState *view) {
-    view->overlay = new_blocknode(0, 0, view->file.size);
-    view->blocks = (BlockArr){};
-    ARR_APPEND(&view->blocks, ((Block){.offset = 0, .data = view->file.data, .len = view->file.size}));
+void insert_data(ViewState *view, uint64_t offset, Block block) {
+    if (block.len == 0) {
+        return;
+    }
+
+    Block *new_b   = &block;
+    Block *start_b = &view->blocks.data[0];
+    Block *end_b   = &view->blocks.data[view->blocks.len-1];
+
+    uint64_t accum_offset = get_total_size(view);
+
+    uint64_t new_b_head   = offset;
+    uint64_t new_b_tail   = offset + new_b->len;
+
+    uint64_t start_b_head = 0;
+    uint64_t start_b_tail = start_b->len;
+
+    uint64_t end_b_head   = accum_offset - end_b->len;
+    uint64_t end_b_tail   = accum_offset;
+
+    // If we need to insert a new block at the end of our data
+    if (new_b_head >= end_b_tail) {
+        ARR_APPEND(&view->blocks, block);
+
+        return;
+
+    // If we just need to push the existing block forward a bit
+    } else if (new_b_head <= start_b_head) {
+        Block post_block = new_block(start_b->data, start_b->len);
+
+        Block old_b = *start_b;
+        *start_b = block;
+
+        ARR_INSERT(&view->blocks, post_block, 1);
+
+        uint64_t new_total_len = block.len + post_block.len;
+        if (new_total_len - post_block.len != new_b->len) {
+            printf("invalid insert!\n");
+            exit(1);
+        }
+
+        return;
+
+    // If we need to do a before/after block split
+    } else {
+        uint64_t accum_offset = 0;
+        for (int i = 0; i < view->blocks.len; i++) {
+            Block *b = &view->blocks.data[i];
+
+            uint64_t b_head  = accum_offset;
+            accum_offset += b->len;
+
+            // Skip any block that ends before our block
+            if (new_b_head > accum_offset) {
+                continue;
+            }
+
+            Block pre_block  = new_block(
+                b->data,
+                new_b_head - b_head
+            );
+            Block mid_block  = *new_b;
+            Block post_block = new_block(
+                b->data + pre_block.len,
+                b->len - pre_block.len
+            );
+
+            Block old_b = *b;
+            *b = pre_block;
+
+            ARR_INSERT(&view->blocks, mid_block, i+1);
+            ARR_INSERT(&view->blocks, post_block, i+2);
+
+            uint64_t new_total_len = pre_block.len + mid_block.len + post_block.len;
+            if (new_total_len - old_b.len != new_b->len) {
+                printf("invalid insert!\n");
+                exit(1);
+            }
+
+            return;
+        }
+    }
+}
+
+
+bool get_data(ViewState *view, uint64_t offset, uint8_t *buffer, uint64_t len) {
+    uint64_t accum_offset = 0;
+
+    for (int i = 0; i < view->blocks.len; i++) {
+        Block *b = &view->blocks.data[i];
+
+        uint64_t view_start  = offset;
+        uint64_t view_end    = offset + len;
+        uint64_t block_start = accum_offset;
+        uint64_t block_end   = accum_offset + b->len;
+        accum_offset += b->len;
+
+        // If the block is before the view range
+        if (block_end < view_start) {
+            continue;
+        }
+
+        // If there's range overlap
+        if (view_start <= block_end && block_start <= view_end) {
+
+            uint64_t start_offset = MAX((int64_t)block_start - (int64_t)view_start, 0);
+            uint64_t bytes_to_grab = MIN(view_end, block_end);
+
+            memcpy(buffer + start_offset, b->data, bytes_to_grab);
+        }
+
+        // If the block is past the view, or crosses the view end
+        if (block_start > view_end || block_end > view_end) {
+            return true;
+        }
+    }
+
+    return true;
 }
 
 int main(int argc, char **argv) {
@@ -325,8 +432,17 @@ int main(int argc, char **argv) {
         .x = 1,
         .y = 1,
     };
-    init_edit_tree(&view);
-    insert_data(&view, (Block){.offset = 10, .data = (uint8_t *)"a", .len = 1});
+    ARR_APPEND(&view.blocks, new_block(view.file.data, view.file.size));
+
+    insert_data(&view, 0, (Block){.data = (uint8_t *)"<3 ", .len = 3});
+    insert_data(&view, get_total_size(&view), (Block){.data = (uint8_t *)"<3 ", .len = 3});
+
+    uint64_t view_offset = 0;
+    uint64_t buffer_len = 50;
+    uint8_t *buffer = calloc(1, buffer_len);
+
+    get_data(&view, view_offset, buffer, buffer_len);
+    print_view(buffer, get_total_size(&view), buffer_len, view_offset);
 /*
 
     get_term_size(&view.w);
