@@ -42,6 +42,11 @@
     }                                                                                                     \
 } while (0);
 
+#define ARR_DELETE(arr, off) do {                                                                     \
+    memmove(&(arr)->data[(off)], &(arr)->data[(off)+1], sizeof(*(arr)->data) * ((arr)->len - (off))); \
+    (arr)->len -= 1;                                                                                  \
+} while (0);
+
 typedef struct {
     char *name;
     uint8_t *data;
@@ -237,18 +242,18 @@ void handle_sigwinch(int unused) {
 }
 
 Block new_block(uint8_t *data, uint64_t len) {
-    return (Block){.data = data, .len = len};
+    return (Block){.data = data, .len = len, .patch = true};
 }
 
 void print_block(Block *b) {
-    printf("Block %p %llu\n", b->data, b->len);
+    printf("Block %p %llu %s\n", b->data, b->len, b->patch ? "(patched)" : "");
 }
 
 void print_blocks(BlockArr *blocks) {
     uint64_t accum_offset = 0;
     for (int i = 0; i < blocks->len; i++) {
         Block *b = &blocks->data[i];
-        printf("Block %p | off: %llu len: %llu\n", b->data, accum_offset, b->len);
+        printf("Block %p | off: %llu len: %llu %s\n", b->data, accum_offset, b->len, b->patch ? "(patched)" : "");
         accum_offset += b->len;
     }
 }
@@ -266,16 +271,52 @@ void delete_data(ViewState *view, uint64_t offset, uint64_t len) {
         return;
     }
 
+    uint64_t d_head = offset;
+    uint64_t d_tail = offset + len;
+
+    uint64_t accum_deleted = 0;
     uint64_t accum_offset = 0;
     for (int i = 0; i < view->blocks.len; i++) {
         Block *b = &view->blocks.data[i];
 
-        uint64_t b_off = accum_offset;
+        uint64_t b_head = accum_offset;
+        uint64_t b_tail = accum_offset + b->len;
+
         accum_offset += b->len;
 
         // Skip any block that ends before our delete
-        if (offset > accum_offset) {
+        if (d_head > b_tail) {
             continue;
+        }
+
+        // exit, we've seen all the blocks we need to edit
+        if (b_head >= d_tail) {
+            break;
+        }
+
+        // if we completely cover a block, just delete it
+        if (d_head <= b_head && d_tail >= b_tail && b->len <= len) {
+            accum_deleted += b->len;
+            b->len = 0;
+
+        // If we overlap a block's start
+        } else if (b_head >= d_head && d_tail <= b_tail) {
+
+            uint64_t delete_leftovers = len - accum_deleted;
+            b->data += delete_leftovers;
+            b->len -= delete_leftovers;
+            accum_deleted += delete_leftovers;
+
+        // If we overlap a block's end
+        } else if (d_head > b_head && d_tail > b_tail && d_head < b_tail) {
+
+            uint64_t delete_coverage = b_tail - d_head;
+            b->len -= delete_coverage;
+            accum_deleted += delete_coverage;
+        }
+
+        if (accum_deleted == len) {
+            break;
         }
     }
 }
@@ -364,7 +405,6 @@ void insert_data(ViewState *view, uint64_t offset, Block block) {
     }
 }
 
-
 bool get_data(ViewState *view, uint64_t offset, uint8_t *buffer, uint64_t len) {
     uint64_t accum_offset = 0;
 
@@ -432,14 +472,16 @@ int main(int argc, char **argv) {
         .x = 1,
         .y = 1,
     };
-    ARR_APPEND(&view.blocks, new_block(view.file.data, view.file.size));
+    ARR_APPEND(&view.blocks, ((Block){.data = view.file.data, .len = view.file.size}));
 
-    insert_data(&view, 0, (Block){.data = (uint8_t *)"<3 ", .len = 3});
-    insert_data(&view, get_total_size(&view), (Block){.data = (uint8_t *)"<3 ", .len = 3});
 
     uint64_t view_offset = 0;
     uint64_t buffer_len = 50;
     uint8_t *buffer = calloc(1, buffer_len);
+
+    insert_data(&view, 0, new_block((uint8_t *)"<3 ", 3));
+    insert_data(&view, 0, new_block((uint8_t *)":) ", 3));
+    delete_data(&view, 1, 6);
 
     get_data(&view, view_offset, buffer, buffer_len);
     print_view(buffer, get_total_size(&view), buffer_len, view_offset);
