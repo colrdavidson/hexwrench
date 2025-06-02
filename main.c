@@ -12,6 +12,7 @@
 #include <sys/ioctl.h>
 
 #define LOG(...) fprintf(stderr, __VA_ARGS__)
+#define LOG2(...) fprintf(stderr, __VA_ARGS__)
 #undef LOG
 #define LOG(...)
 
@@ -677,20 +678,27 @@ int main(int argc, char **argv) {
 
         int max_rows = view.w.rows - 2;
         uint64_t max_offset = (uint64_t)(MAX(0, (int64_t)(view.file.size - (view.file.size % 16)) - (int64_t)(max_rows * 16)));
-        int max_cols = 31;
+        int max_cols = 32;
 
-        int cursor_idx = (view.y * max_cols) + view.x;
+        int cursor_idx = ((view.y * max_cols) + view.x) / 2;
 
         if (!insert_mode) {
             switch (ch) {
+                case 'q': {
+                    return 1;
+                } break;
+
+                // actions
                 case 'i': {
-                    insert_data(&view, cursor_idx / 2, new_block_from_str("i"));
+                    insert_data(&view, cursor_idx, new_block_from_str("i"));
                     view.updated = true;
                 } break;
                 case 'x': {
-                    delete_data(&view, cursor_idx / 2, 1);
+                    delete_data(&view, cursor_idx, 1);
                     view.updated = true;
                 } break;
+
+                // motions
                 case 'g': {
                     view.y = 0;
                     uint64_t new_offset = 0;
@@ -711,7 +719,7 @@ int main(int argc, char **argv) {
                     view.x = MAX(view.x - 1, 0);
                 } break;
                 case 'l': {
-                    view.x = MIN(view.x + 1, max_cols);
+                    view.x = MIN(view.x + 1, max_cols - 1);
                 } break;
                 case 'k': {
                     view.y = MAX(view.y - 1, 0);
@@ -733,14 +741,12 @@ int main(int argc, char **argv) {
                         }
                     }
                 } break;
-                case 'q': {
-                    return 1;
-                } break;
+
+                // no clue, try again
                 default: {
                     goto read_char;
                 } break;
             }
         }
-
     }
 }
