@@ -11,8 +11,13 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 
+#define LOG(...) fprintf(stderr, __VA_ARGS__)
+#undef LOG
+#define LOG(...)
+
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define BLOCK_LEN 1024
 
 #define ARR_EXPAND(arr) do {                                                   \
     if (((arr)->len + 1) > (arr)->cap) {                                       \
@@ -48,6 +53,18 @@
 } while (0);
 
 typedef struct {
+    uint8_t *data;
+    int64_t len;
+} Str;
+
+Str stralloc(const char *str) {
+    int len = strlen(str);
+    uint8_t *tmp = malloc(len + 1);
+    strncpy((char *)tmp, str, len + 1);
+    return (Str){.data = tmp, .len = len};
+}
+
+typedef struct {
     char *name;
     uint8_t *data;
     uint64_t size;
@@ -76,8 +93,10 @@ typedef struct {
     Window w;
     int x;
     int y;
+    bool updated;
 
-    uint64_t view_size;
+    uint8_t *buffer; 
+    uint64_t buffer_len;
     uint64_t offset;
 
     BlockArr blocks;
@@ -113,7 +132,7 @@ void reset_cursor(void) {
     write(0, term_buf, len);
 }
 void set_cursor(int row, int col) {
-    int len = snprintf(term_buf, sizeof(term_buf), "\x1b[%d;%dH", row, col);
+    int len = snprintf(term_buf, sizeof(term_buf), "\x1b[%d;%dH", col, row);
     write(0, term_buf, len);
 }
 void erase_line(void) {
@@ -133,7 +152,7 @@ void reset_color(void) {
     write(0, term_buf, len);
 }
 
-void print_view(uint8_t *buffer, uint64_t total_size, uint64_t buffer_size, uint64_t offset) {
+void print_view(uint8_t *buffer, uint64_t buffer_size, uint64_t total_size, uint64_t offset) {
     if (((int64_t)total_size - (int64_t)offset) <= 0) {
         printf("no bytes to display!\n");
         return;
@@ -192,68 +211,31 @@ void print_view(uint8_t *buffer, uint64_t total_size, uint64_t buffer_size, uint
     return;
 }
 
-struct termios orig_termios;
-void cleanup_term(void) {
-    tcsetattr(0, TCSAFLUSH, &orig_termios);
-    disable_altbuffer();
-}
-void init_term(void) {
-    enable_altbuffer();
-
-    tcgetattr(0, &orig_termios);
-    atexit(cleanup_term);
-
-    struct termios raw = orig_termios;
-    raw.c_lflag &= ~(ECHO | ICANON);
-    tcsetattr(0, TCSAFLUSH, &raw);
+bool has_overlap(uint64_t a_start, uint64_t a_end, uint64_t b_start, uint64_t b_end) {
+    return a_end >= b_start && a_start <= b_end;
 }
 
-
-bool get_term_size(Window *w) {
-    struct winsize ws;
-    if (ioctl(1, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
-        return false;
-    }
-
-    w->rows = ws.ws_row - 1;
-    w->cols = ws.ws_col;
-    return true;
+Block new_block(uint8_t *data, uint64_t len, bool patch) {
+    return (Block){.data = data, .len = len, .patch = patch};
 }
 
-ViewState view;
-void refresh_screen(void) {
-    clear_term();
-    reset_cursor();
-
-    set_background(244);
-    set_foreground(232);
-    erase_line();
-
-    printf("%s -- %llu bytes\n", view.file.name, view.file.size);
-
-    reset_color();
-    //print_view(&view, (view.w.rows - 1) * 16, view.offset);
-    set_cursor(view.w.rows + 1, 1);
-}
-
-void handle_sigwinch(int unused) {
-    get_term_size(&view.w);
-    refresh_screen();
-}
-
-Block new_block(uint8_t *data, uint64_t len) {
-    return (Block){.data = data, .len = len, .patch = true};
+Block new_block_from_str(const char *str) {
+    Str s = stralloc(str);
+    return (Block){.data = s.data, .len = s.len, .patch = false};
 }
 
 void print_block(Block *b) {
-    printf("Block %p %llu %s\n", b->data, b->len, b->patch ? "(patched)" : "");
+    LOG("Block %p %llu %s\n", b->data, b->len, b->patch ? "(patched)" : "");
+}
+void print_block_w_offset(Block *b, uint64_t offset) {
+    LOG("Block %p %llx -> %llx %s\n", b->data, offset, offset + b->len, b->patch ? "(patched)" : "");
 }
 
 void print_blocks(BlockArr *blocks) {
     uint64_t accum_offset = 0;
     for (int i = 0; i < blocks->len; i++) {
         Block *b = &blocks->data[i];
-        printf("Block %p | off: %llu len: %llu %s\n", b->data, accum_offset, b->len, b->patch ? "(patched)" : "");
+        LOG("Block %p | off: %llu len: %llu %s\n", b->data, accum_offset, b->len, b->patch ? "(patched)" : "");
         accum_offset += b->len;
     }
 }
@@ -266,7 +248,71 @@ uint64_t get_total_size(ViewState *view) {
     return accum_offset;
 }
 
-void delete_data(ViewState *view, uint64_t offset, uint64_t len) {
+void generate_patchblock(ViewState *view, int block_idx, uint64_t inner_offset) {
+    Block *b = &view->blocks.data[block_idx];
+
+    uint64_t rounded_offset = inner_offset - (inner_offset % BLOCK_LEN);
+    uint64_t prev_b_len = BLOCK_LEN * (inner_offset / BLOCK_LEN);
+    uint64_t seg_len = b->len - rounded_offset;
+
+    uint64_t block_len = MIN(seg_len, BLOCK_LEN);
+
+    uint8_t *bbuffer = malloc(block_len);
+    memcpy(bbuffer, b->data + rounded_offset, block_len);
+    Block patch_block = new_block(bbuffer, block_len, true);
+
+    LOG("generating patchblock\n");
+    LOG("inner: %llu, rounded: %llu | seg_len: %llu, block_len: %llu\n", inner_offset, rounded_offset, seg_len, block_len);
+    print_block_w_offset(&patch_block, rounded_offset);
+
+    if (b->len < BLOCK_LEN) {
+        LOG("Converting the whole block to a patch block\n");
+        *b = patch_block;
+        return;
+    }
+
+    // Do a head-insert
+    if (rounded_offset == 0) {
+        LOG("head patch\n");
+        LOG("pre-patch blocks\n");
+        print_blocks(&view->blocks);
+
+        Block old_b = *b;
+        *b = patch_block;
+        Block next_b = new_block(old_b.data + patch_block.len, old_b.len - patch_block.len, false);
+        ARR_INSERT(&view->blocks, next_b, block_idx+1);
+
+        LOG("post-patch blocks\n");
+        print_blocks(&view->blocks);
+
+        return;
+    } else {
+        LOG("middle patch\n");
+        //print_blocks(&view->blocks);
+
+        Block old_b = *b;
+        Block prev_b = new_block(old_b.data, prev_b_len, false);
+        Block next_b = new_block(old_b.data + rounded_offset + patch_block.len, old_b.len - prev_b.len - patch_block.len, false);
+
+        LOG("block to split, splitting at %llu\n", rounded_offset);
+        print_block(&old_b);
+
+        LOG("pieces\n");
+        print_block(&prev_b);
+        print_block(&patch_block);
+        print_block(&next_b);
+
+        *b = prev_b;
+        ARR_INSERT(&view->blocks, patch_block, block_idx+1);
+        ARR_INSERT(&view->blocks, next_b,      block_idx+2);
+
+        LOG("middle insert done\n");
+        //print_blocks(&view->blocks);
+        return;
+    }
+}
+
+void generate_patchruns(ViewState *view, uint64_t offset, uint64_t len) {
     if (len == 0) {
         return;
     }
@@ -274,10 +320,14 @@ void delete_data(ViewState *view, uint64_t offset, uint64_t len) {
     uint64_t d_head = offset;
     uint64_t d_tail = offset + len;
 
-    uint64_t accum_deleted = 0;
     uint64_t accum_offset = 0;
     for (int i = 0; i < view->blocks.len; i++) {
         Block *b = &view->blocks.data[i];
+
+        // skip over tombstones
+        if (b->len == 0) {
+            continue;
+        }
 
         uint64_t b_head = accum_offset;
         uint64_t b_tail = accum_offset + b->len;
@@ -294,13 +344,61 @@ void delete_data(ViewState *view, uint64_t offset, uint64_t len) {
             break;
         }
 
+        uint64_t inner_offset = (uint64_t)MAX((int64_t)d_head - (int64_t)b_head, (int64_t)b_head);
+        if (!b->patch) {
+            generate_patchblock(view, i, inner_offset);
+        }
+    }
+}
+
+void delete_data(ViewState *view, uint64_t offset, uint64_t len) {
+    if (len == 0) {
+        return;
+    }
+
+    LOG("deleting from %llx -> %llx\n", offset, offset+len);
+    generate_patchruns(view, offset, len);
+
+    uint64_t d_head = offset;
+    uint64_t d_tail = offset + len;
+
+    uint64_t accum_deleted = 0;
+    uint64_t accum_offset = 0;
+    for (int i = 0; i < view->blocks.len; i++) {
+        Block *b = &view->blocks.data[i];
+
+        // skip over tombstones
+        if (b->len == 0) {
+            continue;
+        }
+
+        uint64_t b_head = accum_offset;
+        uint64_t b_tail = accum_offset + b->len;
+
+        accum_offset += b->len;
+
+        // Skip any block that ends before our delete
+        if (d_head > b_tail) {
+            continue;
+        }
+
+        // exit, we've seen all the blocks we need to edit
+        if (b_head >= d_tail) {
+            break;
+        }
+
+        uint64_t inner_offset = (uint64_t)MAX((int64_t)d_head - (int64_t)b_head, (int64_t)b_head);
+
         // if we completely cover a block, just delete it
         if (d_head <= b_head && d_tail >= b_tail && b->len <= len) {
+            LOG("deleting full block\n");
             accum_deleted += b->len;
             b->len = 0;
 
         // If we overlap a block's start
         } else if (b_head >= d_head && d_tail <= b_tail) {
+            LOG("deleting block start\n");
+            print_block_w_offset(b, accum_offset);
 
             uint64_t delete_leftovers = len - accum_deleted;
             b->data += delete_leftovers;
@@ -309,10 +407,18 @@ void delete_data(ViewState *view, uint64_t offset, uint64_t len) {
 
         // If we overlap a block's end
         } else if (d_head > b_head && d_tail > b_tail && d_head < b_tail) {
+            LOG("deleting block end\n");
 
             uint64_t delete_coverage = b_tail - d_head;
             b->len -= delete_coverage;
             accum_deleted += delete_coverage;
+
+        // Middle-deletes
+        } else if (d_head >= b_head && d_tail <= b_tail) {
+            LOG("deleting block middle\n");
+            memmove(b->data + inner_offset, b->data + inner_offset + len, b->len - len);
+            b->len -= len;
+            accum_deleted += len;
         }
 
         if (accum_deleted == len) {
@@ -349,9 +455,7 @@ void insert_data(ViewState *view, uint64_t offset, Block block) {
 
     // If we just need to push the existing block forward a bit
     } else if (new_b_head <= start_b_head) {
-        Block post_block = new_block(start_b->data, start_b->len);
-
-        Block old_b = *start_b;
+        Block post_block = *start_b;
         *start_b = block;
 
         ARR_INSERT(&view->blocks, post_block, 1);
@@ -380,12 +484,14 @@ void insert_data(ViewState *view, uint64_t offset, Block block) {
 
             Block pre_block  = new_block(
                 b->data,
-                new_b_head - b_head
+                new_b_head - b_head,
+                b->patch
             );
             Block mid_block  = *new_b;
             Block post_block = new_block(
                 b->data + pre_block.len,
-                b->len - pre_block.len
+                b->len - pre_block.len,
+                b->patch
             );
 
             Block old_b = *b;
@@ -407,6 +513,7 @@ void insert_data(ViewState *view, uint64_t offset, Block block) {
 
 bool get_data(ViewState *view, uint64_t offset, uint8_t *buffer, uint64_t len) {
     uint64_t accum_offset = 0;
+    uint64_t accum_len = 0;
 
     for (int i = 0; i < view->blocks.len; i++) {
         Block *b = &view->blocks.data[i];
@@ -425,10 +532,12 @@ bool get_data(ViewState *view, uint64_t offset, uint8_t *buffer, uint64_t len) {
         // If there's range overlap
         if (view_start <= block_end && block_start <= view_end) {
 
-            uint64_t start_offset = MAX((int64_t)block_start - (int64_t)view_start, 0);
-            uint64_t bytes_to_grab = MIN(view_end, block_end);
+            uint64_t start_offset = MAX((int64_t)view_start - (int64_t)block_start, 0);
+            uint64_t bytes_to_grab = MIN(len, b->len);
 
-            memcpy(buffer + start_offset, b->data, bytes_to_grab);
+            //printf("buffer[0x%llx] | writing %llu bytes, from block[%llx]\n", accum_len, bytes_to_grab, start_offset);
+            memcpy(buffer + accum_len, b->data + start_offset, bytes_to_grab);
+            accum_len += bytes_to_grab;
         }
 
         // If the block is past the view, or crosses the view end
@@ -438,6 +547,79 @@ bool get_data(ViewState *view, uint64_t offset, uint8_t *buffer, uint64_t len) {
     }
 
     return true;
+}
+
+struct termios orig_termios;
+void cleanup_term(void) {
+    tcsetattr(0, TCSAFLUSH, &orig_termios);
+    disable_altbuffer();
+}
+void init_term(void) {
+    enable_altbuffer();
+
+    tcgetattr(0, &orig_termios);
+    atexit(cleanup_term);
+
+    struct termios raw = orig_termios;
+    raw.c_lflag &= ~(ECHO | ICANON);
+    tcsetattr(0, TCSAFLUSH, &raw);
+}
+
+
+bool get_term_size(Window *w) {
+    struct winsize ws;
+    if (ioctl(1, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
+        return false;
+    }
+
+    w->rows = ws.ws_row - 1;
+    w->cols = ws.ws_col;
+    return true;
+}
+
+
+ViewState view;
+void update_buffer_size(void) {
+    uint64_t req_len = (view.w.rows - 1) * 16;
+    if (view.buffer_len != req_len) {
+        view.buffer_len = req_len;
+        view.buffer = realloc(view.buffer, view.buffer_len);
+        view.updated = true;
+    }
+}
+
+void refresh_screen(void) {
+    if (view.updated) {
+        clear_term();
+    }
+
+    reset_cursor();
+    if (view.updated) {
+        set_background(244);
+        set_foreground(232);
+        erase_line();
+
+        printf("%s -- %llu bytes\n", view.file.name, view.file.size);
+
+        reset_color();
+        update_buffer_size();
+
+        get_data(&view, view.offset, view.buffer, view.buffer_len);
+        print_view(view.buffer, view.buffer_len, get_total_size(&view), view.offset);
+    }
+
+    int cluster_adj = view.x / 2;
+    int inner_adj = view.x % 2;
+    int cur_x = 11 + (cluster_adj * 3) + inner_adj;
+
+    set_cursor(cur_x, view.y + 2);
+    view.updated = false;
+}
+
+void handle_sigwinch(int unused) {
+    get_term_size(&view.w);
+    view.updated = true;
+    refresh_screen();
 }
 
 int main(int argc, char **argv) {
@@ -465,27 +647,22 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    //init_term();
+    init_term();
 
     view = (ViewState){
         .file = (File){.name = argv[1], .data = file_bytes, .size = file_size},
-        .x = 1,
-        .y = 1,
+        .x = 0,
+        .y = 0,
+        .buffer_len = 0,
+        .buffer = NULL,
+        .updated = true
     };
-    ARR_APPEND(&view.blocks, ((Block){.data = view.file.data, .len = view.file.size}));
+    ARR_APPEND(&view.blocks, new_block(view.file.data, view.file.size, false));
+    update_buffer_size();
 
-
-    uint64_t view_offset = 0;
-    uint64_t buffer_len = 50;
-    uint8_t *buffer = calloc(1, buffer_len);
-
-    insert_data(&view, 0, new_block((uint8_t *)"<3 ", 3));
-    insert_data(&view, 0, new_block((uint8_t *)":) ", 3));
-    delete_data(&view, 1, 6);
-
-    get_data(&view, view_offset, buffer, buffer_len);
-    print_view(buffer, get_total_size(&view), buffer_len, view_offset);
-/*
+    //insert_data(&view, 0, new_block_from_str("<3 "));
+    //insert_data(&view, 0, new_block_from_str(":) "));
+    //delete_data(&view, 1, 7);
 
     get_term_size(&view.w);
     signal(SIGWINCH, handle_sigwinch);
@@ -498,21 +675,63 @@ int main(int argc, char **argv) {
     read_char:
         read(0, &ch, 1);
 
-        uint64_t max_offset = (uint64_t)(MAX(0, (int64_t)(view.file.size - (view.file.size % 16)) - (int64_t)((view.w.rows - 2) * 16)));
+        int max_rows = view.w.rows - 2;
+        uint64_t max_offset = (uint64_t)(MAX(0, (int64_t)(view.file.size - (view.file.size % 16)) - (int64_t)(max_rows * 16)));
+        int max_cols = 31;
+
+        int cursor_idx = (view.y * max_cols) + view.x;
 
         if (!insert_mode) {
             switch (ch) {
+                case 'i': {
+                    insert_data(&view, cursor_idx / 2, new_block_from_str("i"));
+                    view.updated = true;
+                } break;
+                case 'x': {
+                    delete_data(&view, cursor_idx / 2, 1);
+                    view.updated = true;
+                } break;
                 case 'g': {
-                    view.offset = 0;
+                    view.y = 0;
+                    uint64_t new_offset = 0;
+                    if (view.offset != new_offset) {
+                        view.offset = new_offset;
+                        view.updated = true;
+                    }
                 } break;
                 case 'G': {
-                    view.offset = max_offset;
+                    view.y = max_rows;
+                    uint64_t new_offset = max_offset;
+                    if (view.offset != new_offset) {
+                        view.offset = new_offset;
+                        view.updated = true;
+                    }
+                } break;
+                case 'h': {
+                    view.x = MAX(view.x - 1, 0);
+                } break;
+                case 'l': {
+                    view.x = MIN(view.x + 1, max_cols);
                 } break;
                 case 'k': {
-                    view.offset = (uint64_t)MAX((int64_t)(view.offset - 16), 0);
+                    view.y = MAX(view.y - 1, 0);
+                    if (view.y - 1 < 0) {
+                        uint64_t new_offset = (uint64_t)MAX((int64_t)(view.offset - 16), 0);
+                        if (view.offset != new_offset) {
+                            view.offset = new_offset;
+                            view.updated = true;
+                        }
+                    }
                 } break;
                 case 'j': {
-                    view.offset = MIN(view.offset + 16, max_offset);
+                    view.y = MIN(view.y + 1, max_rows);
+                    if (view.y + 1 > max_rows) {
+                        uint64_t new_offset = MIN(view.offset + 16, max_offset);
+                        if (view.offset != new_offset) {
+                            view.offset = new_offset;
+                            view.updated = true;
+                        }
+                    }
                 } break;
                 case 'q': {
                     return 1;
@@ -522,6 +741,6 @@ int main(int argc, char **argv) {
                 } break;
             }
         }
+
     }
-*/
 }
